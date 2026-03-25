@@ -1,7 +1,7 @@
 {.experimental: "callOperator".}
 
 import std/macros
-import std/typeinfo
+
 import std/tables
 import std/lists
 const MultiThrd = compileOption"threads" and not defined(js)
@@ -26,17 +26,14 @@ type
     cache: Table[K, V]
     root: Root[K, V]
 
-template initAs(res, K, V){.dirty.} =
+template initAs(res, K, V, tmaxsize){.dirty.} =
   let res = new Cache[K, V]
   res.root = initDoublyLinkedRing[Node[K, V]]()
+  res.maxsize = tmaxsize
   when MultiThrd:
     res.lock.initLock()
 
-proc proc_gen_fromImpl(f, cacheName, body: NimNode): NimNode =
-  ## also gen:
-  ##  - var cache: Table[K, V]
-  ##  - let key: K
-  ##  - `template user_function_call(): R`
+proc proc_gen_fromImpl(f, cacheName, body: NimNode; maxsize: NimNode): NimNode =
 
   let f_name = f.name
   let params = f.params
@@ -69,7 +66,7 @@ proc proc_gen_fromImpl(f, cacheName, body: NimNode): NimNode =
   f.name = name_nocache
   result.add f
   result.add quote do:
-    initAs(`ori_name`, `ArgsType`, `ResType`)
+    initAs(`ori_name`, `ArgsType`, `ResType`, `maxsize`)
 
 
   let nbody = newStmtList(
@@ -93,7 +90,8 @@ proc proc_gen_fromImpl(f, cacheName, body: NimNode): NimNode =
 
 # macro proc_gen_from(f; body): untyped = proc_gen_fromImpl(newEmptyNode(), f, body)
 
-macro proc_gen_from(f, cacheName; body): untyped = proc_gen_fromImpl(f, cacheName, body)
+macro proc_gen_from(f, cacheName; body): untyped = proc_gen_fromImpl(f, cacheName, body, newLit 0)
+macro proc_gen_from(f, cacheName, maxsize; body): untyped = proc_gen_fromImpl(f, cacheName, body, maxsize)
 
 
 proc cache_info*(self: Cache): CacheInfo =
@@ -113,36 +111,115 @@ proc cache_clear*(self: Cache) =
 
 template cache_wrapper(user_function; typed: bool): auto =
   # Simple caching without ordering or size limit
-  #def wrapper(*args, **kwds):
+  # def wrapper(*args, **kwds):
   #nonlocal hits, misses
 
   proc_gen_from user_function, res:
-    res.cache.withValue(key, value):
-      result = value[]
+    res.cache.withValue(key, valueOfCache):
+      result = valueOfCache[]
       res.hits += 1
     do:
       res.misses += 1
       result = user_function_call()
       res.cache[key] = result
 
-#proc lru_cache_wrapper(user_function: proc, maxsize: int, typed: bool) =
+template lru_cache_wrapper(user_function; maxsize: int, typed: bool): auto =
+  proc_gen_from user_function, res, maxsize:
+    let MaxSize = maxsize   # to ensure evaluation only once
+    if MaxSize == 0:
+      res.misses += 1
+      return user_function_call()
+    else:
+      withLock res.lock:
+        res.cache.withValue(key, valueOfCache):
+          let link = valueOfCache[]
+          # Move the link to the front of the circular queue
+          res.root.prepend (key, link)
+          res.hits += 1
+          return link
+        do:
+          res.misses += 1
+
+      result = user_function_call()
+      withLock res.lock:
+        if key in res.cache:
+          discard
+          #[Getting here means that this same key was added to the
+  cache while the lock was released.  Since the link
+  update is already done, we need only return the
+  computed result and update the count of misses.]#
+        elif res.full:
+          # Use the old root to store the new key and result.
+          let oldroot = res.root.head
+          oldroot.value.key = key
+          oldroot.value.result = result
+
+          # Empty the oldest link and make it the new root.
+          # Keep a reference to the old key and old result to
+          # prevent their ref counts from going to zero during the
+          # update. That will prevent potentially arbitrary object
+          # clean-up code (i.e. __del__) from running while we're
+          # still adjusting the links.
+          template root: untyped = res.root.head
+          root = oldroot.next
+
+          let oldkey = root.value.key
+          discard root.value.result
+          root.value.key.reset
+          root.value.result.reset
+
+          res.cache.del oldkey
+          #[Save the potentially reentrant cache[key] assignment
+            for last, after the root and links have been put in
+            a consistent state.]#
+          res.cache[key] = oldroot.value.result
+        else:
+          res.root.prepend (key, result)
+          res.cache[key] = result
+          res.full = res.cache.len >= MaxSize
+
+
+proc lru_cacheImpl(maxsize, typed: NimNode, user_function: NimNode): NimNode =
+  ## used as pragma
+  let maxsize = quote do:
+    if `maxsize` < 0: 0 else: `maxsize`
+  result = newCall(bindSym"lru_cache_wrapper", user_function, maxsize, typed)
 
 
 proc cacheImpl(typed=false, user_function: NimNode): NimNode =
   result = newCall(bindSym"cache_wrapper", user_function, newLit typed)
 
 
+macro lru_cache*(maxsize:untyped=128, typed:untyped=false, user_function) = lru_cacheImpl(maxsize, typed, user_function)
+macro lru_cache*(maxsize:untyped=128, user_function) = lru_cacheImpl(maxsize, newLit false, user_function)
+macro lru_cache*(user_function) = lru_cacheImpl(newLit 128, newLit false, user_function)
+#macro lru_cache*(maxsize: Option, typed=false, user_function: typed) =
+
 macro cache*(user_function) =
   ## used as pragma
   result = cacheImpl(user_function = user_function)
 
 when isMainModule:
-  proc f(x: int): int{.cache.} = x+1
-  assert f(0) == 1
-  let time1state = f.cache_info
-  assert time1state.hits == 0
-  assert time1state.misses == 1
-  assert f(0) == 1
-  assert f.cache_info.hits == 1
-  #echo typeof f
+  import std/unittest
+  test "t_cache":
+    proc f(x: int): int{.cache.} = x+1
+    check f(0) == 1
+    let time1state = f.cache_info()
+    check time1state.hits == 0
+    check time1state.misses == 1
+    check f(0) == 1
+    check f.cache_info().hits == 1
+  test "t_lru_cache":
+    proc g(x: int): int{.lru_cache(1).} = x+1
+    check g(0) == 1
+    let time1state = g.cache_info()
+    check time1state.hits == 0
+    check time1state.misses == 1
+    check g(0) == 1
+    check g.cache_info().hits == 1
+
+    check g(1) == 2
+    check g.cache_info().misses == 2
+    check g(0) == 1
+    check g.cache_info().hits == 1
 
