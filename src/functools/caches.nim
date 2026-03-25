@@ -18,16 +18,22 @@ type
   ]
   Root[K, V] = DoublyLinkedRing[Node[K, V]]
                             
-  Cache[K, V] = ref object
+  Cache[K, V, P] = ref object
     hits, misses: int
     lock: Lock
     maxsize: int
     full: bool
     cache: Table[K, V]
     root: Root[K, V]
+    call: P
 
-template initAs(res, K, V, tmaxsize){.dirty.} =
-  let res = new Cache[K, V]
+macro `()`*(self: Cache, args: varargs[untyped]): untyped =
+  result = newCall quote do: `self`.call
+  for i in args:
+    result.add i
+
+template initAs(res, K, V, P, tmaxsize){.dirty.} =
+  let res = new Cache[K, V, P]
   res.root = initDoublyLinkedRing[Node[K, V]]()
   res.maxsize = tmaxsize
   when MultiThrd:
@@ -35,13 +41,14 @@ template initAs(res, K, V, tmaxsize){.dirty.} =
 
 proc proc_gen_fromImpl(f, cacheName, body: NimNode; maxsize: NimNode): NimNode =
 
+  let emptyn = newEmptyNode()
   let f_name = f.name
   let params = f.params
 
   var ori_name = f_name
-  var nname = parseExpr"`()`"
+  let nname = emptyn
   if f_name.kind == nnkPrefix and f_name[0].eqIdent"*":
-    nname = f_name.prefix"*"
+    # nname = f_name.prefix"*"
     ori_name = f_name[1]
 
   let name_nocache = genSym(nskProc, ori_name.strVal & "_nocache")
@@ -51,7 +58,10 @@ proc proc_gen_fromImpl(f, cacheName, body: NimNode; maxsize: NimNode): NimNode =
   let
     tupVal = newNimNode nnkTupleConstr
     ArgsType = newNimNode nnkTupleConstr
+    PrcType = newNimNode nnkProcTy
+    argsOfPrcType = nnkFormalParams.newTree ResType
     call = newCall name_nocache
+
   for i in 1..<params.len:
     let p = params[i]
     let ty = p[^2]
@@ -61,32 +71,36 @@ proc proc_gen_fromImpl(f, cacheName, body: NimNode; maxsize: NimNode): NimNode =
       call.add pj
       tupVal.add pj
       ArgsType.add ty
+      argsOfPrcType.add newIdentDefs(pj, ty)
+
+  PrcType.add argsOfPrcType
+  PrcType.add emptyn  # pragma, here defaults to {.closure.}
 
   result = newStmtList()
   f.name = name_nocache
   result.add f
   result.add quote do:
-    initAs(`ori_name`, `ArgsType`, `ResType`, `maxsize`)
-
+    initAs(`ori_name`, `ArgsType`, `ResType`, `PrcType`, `maxsize`)
 
   let nbody = newStmtList(
     quote do:
       let key{.inject.} = `tupVal`
       template user_function_call(): untyped{.inject.} = `call`
-      # template `cacheName`: untyped{.inject.} = `ori_name`
+      template `cacheName`: untyped{.inject.} = `ori_name`
     ,
     body
   )
-  let nparams = nnkFormalParams.newTree ResType
-  nparams.add newIdentDefs(cacheName, quote do: Cache[`ArgsType`, `ResType`])
-  nparams.add params[1..^1]
+  let nparams = params
 
-  result.add nnkProcDef.newTree(nname, f[1], f[2],
+  let cbPragmas = f[4]
+
+  let cb = nnkProcDef.newTree(nname, f[1], f[2],
     nparams,  # params
-    f[4], f[5],
+    cbPragmas, f[5],
     nbody
   )
-
+  result.add quote do:
+    `ori_name`.call = `cb`
 
 # macro proc_gen_from(f; body): untyped = proc_gen_fromImpl(newEmptyNode(), f, body)
 
@@ -201,16 +215,16 @@ macro cache*(user_function) =
 
 when isMainModule:
   import std/unittest
+  proc f(x: int): int{.cache.} = x+1
   test "t_cache":
-    proc f(x: int): int{.cache.} = x+1
     check f(0) == 1
     let time1state = f.cache_info()
     check time1state.hits == 0
     check time1state.misses == 1
     check f(0) == 1
     check f.cache_info().hits == 1
+  proc g(x: int): int{.lru_cache(1).} = x+1
   test "t_lru_cache":
-    proc g(x: int): int{.lru_cache(1).} = x+1
     check g(0) == 1
     let time1state = g.cache_info()
     check time1state.hits == 0
