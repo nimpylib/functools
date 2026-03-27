@@ -1,3 +1,14 @@
+## ## Why is the 1st argument of `reduce` `ProcCallable`?
+## `reduce`_'s first argument `function` is [`Callable` abstract class](https://docs.python.org/3/library/collections.abc.html#collections.abc.Callable) in Python.
+##
+## Here it's currently `ProcCallable`, meaning we only accept proc type as this Callable, because:
+##
+## 1. in Nim unless `{.experimental: "callOperator".}` is enabled, only proc is callable.
+## 2. I've tried to declare `Callable[T: openArray[typedesc], R] = concept ...` but it just cannot matched proc
+##
+## ## Why not simply write as `proc (a1: T, a2: R): R`?
+## 1. it's too long
+## 2. this library is aimed to be look like Python's `functools`, and `ProcCallable [[R, T], R]` is the most similar with `Callable[[R, T], R]`
 
 type
   Iterable[T] = concept self
