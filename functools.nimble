@@ -23,4 +23,6 @@ template pylib(x, ver) =
            else: pylibPre & x
 
 pylib "handy_sugars", " ^= 0.1.0"
+pylib "pytyping", " ^= 0.1.0"
+pylib "collections_abc", " ^= 0.1.0"
 
